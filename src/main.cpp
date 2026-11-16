@@ -1,0 +1,308 @@
+// mini DV 平台：被测逻辑是同步 FIFO，验证平台按 UVM 的分层复现一遍
+//   generator(CRV) → driver → DUT → monitor → scoreboard → coverage
+// 不依赖任何 EDA 工具，全部软件实现，目的是把验证方法学本身讲清楚。
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <random>
+#include <string>
+#include <string>
+#include <vector>
+
+// ---------------- DUT：同步 FIFO ----------------
+struct Fifo {
+    bool bug = false;   // 注入 bug：满的时候仍然写，用来验证平台能不能抓到
+    int depth;
+    std::vector<int> mem;
+    int wr = 0, rd = 0, count = 0;
+    bool overflow = false, underflow = false;
+
+    explicit Fifo(int d) : depth(d), mem(d, 0) {}
+
+    // 一个时钟沿：同时给出读写信号
+    void tick(bool wr_en, bool rd_en, int din, int& dout, bool& full, bool& empty) {
+        dout = 0;
+        full = (count == depth);
+        empty = (count == 0);
+
+        bool do_read = rd_en && !empty;              // 空读被忽略（记 underflow）
+        if (rd_en && empty) underflow = true;
+        bool do_write = wr_en && (!full || bug);      // 满写被忽略（记 overflow）；注入 bug 时不忽略
+        if (wr_en && full) overflow = true;
+
+        if (do_read) {
+            dout = mem[rd];
+            rd = (rd + 1) % depth;
+            count--;
+        }
+        if (do_write) {
+            mem[wr] = din;
+            wr = (wr + 1) % depth;
+            count++;
+        }
+        full = (count == depth);
+        empty = (count == 0);
+    }
+};
+
+// ---------------- 参考模型：和 DUT 独立实现（不能拿 DUT 当期望） ----------------
+struct RefModel {
+    int depth;
+    std::vector<int> q;
+    explicit RefModel(int d) : depth(d) {}
+
+    // 和 RTL 的同拍读写语义保持一致：先读后写
+    void step(bool wr_en, bool rd_en, int din, int& dout, bool& full, bool& empty) {
+        dout = 0;
+        full = ((int)q.size() == depth);
+        empty = q.empty();
+        if (rd_en && !q.empty()) {
+            dout = q.front();
+            q.erase(q.begin());
+        }
+        if (wr_en && (int)q.size() < depth) q.push_back(din);
+        full = ((int)q.size() == depth);
+        empty = q.empty();
+    }
+};
+
+// ---------------- 覆盖率：功能覆盖点 + 交叉覆盖 ----------------
+struct Coverage {
+    std::map<std::string, std::pair<int, int>> bins;  // name -> {hit, total}
+    void def(const std::string& n, int total) { bins[n] = {0, total}; }
+    void hit(const std::string& n) { if (bins.count(n)) bins[n].first++; }
+    void hitBin(const std::string& n, int idx) {
+        // idx 用于把「命中第几个 bin」摊平成一行，便于统计
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s[%d]", n.c_str(), idx);
+        hit(buf);
+    }
+    double percent() const {
+        int h = 0, t = 0;
+        for (auto& kv : bins) { if (kv.second.first > 0) h++; t++; }
+        return t ? 100.0 * h / t : 0;
+    }
+    std::vector<std::string> missed() const {
+        std::vector<std::string> m;
+        for (auto& kv : bins) if (kv.second.first == 0) m.push_back(kv.first);
+        return m;
+    }
+};
+
+static const int LEVELS = 4;   // 水位：0=空 1=低 2=高 3=满
+static const int NUM_RANGES = 4;  // din: 零/正小/正大/负
+
+static void initCoverage(Coverage& c) {
+    const char* simple[] = {"wr_only", "rd_only", "simul_rw", "idle"};
+    for (auto n : simple) c.def(n, 1);
+    for (int i = 0; i < LEVELS; ++i) c.def("level[" + std::to_string(i) + "]", 1);
+    for (int i = 0; i < NUM_RANGES; ++i) c.def("din_range[" + std::to_string(i) + "]", 1);
+    c.def("x_full_wr[0]", 1);
+    c.def("x_empty_rd[0]", 1);
+    c.def("b2b_write[0]", 1);
+    c.def("b2b_read[0]", 1);
+    c.def("wrap_around[0]", 1);
+}
+
+// 数据边界：0 / 小值 / 大值 / 全 1（255 最容易暴露位宽截断）
+static int dinRange(int v) {
+    if (v == 0) return 0;
+    if (v > 0 && v < 128) return 1;
+    if (v < 255) return 2;
+    return 3;
+}
+
+static void sampleCoverage(Coverage& c, bool wr, bool rd, int din, int count, int depth) {
+    if (wr && rd) c.hit("simul_rw");
+    else if (wr) c.hit("wr_only");
+    else if (rd) c.hit("rd_only");
+    else c.hit("idle");
+
+    int lv = 0;
+    if (count == 0) lv = 0;
+    else if (count == depth) lv = 3;
+    else if (count * 2 < depth) lv = 1;
+    else lv = 2;
+    c.hitBin("level", lv);
+    c.hitBin("din_range", dinRange(din));
+
+    if (wr && count == depth) c.hitBin("x_full_wr", 0);
+    if (rd && count == 0) c.hitBin("x_empty_rd", 0);
+}
+
+// ---------------- 结果 ----------------
+struct Result {
+    long cycles = 0, mismatches = 0, wrCycles = 0, rdCycles = 0;
+    long ovf = 0, udf = 0;
+    std::string firstMismatch;
+};
+
+static int g_depth = 8;
+
+// 单拍执行 + 比对（DUT 与参考模型并行推进）
+static inline void stepOne(Fifo& dut, RefModel& ref, bool wr, bool rd, int din, Result& r,
+                           Coverage* cov, bool prevWr, bool prevRd) {
+    int doutDut = 0, doutRef = 0;
+    bool fullD, emptyD, fullR, emptyR;
+    int cntBefore = dut.count;
+
+    dut.tick(wr, rd, din, doutDut, fullD, emptyD);
+    ref.step(wr, rd, din, doutRef, fullR, emptyR);
+
+    r.cycles++;
+    if (wr) r.wrCycles++;
+    if (rd) r.rdCycles++;
+    if (dut.overflow) { r.ovf++; dut.overflow = false; }
+    if (dut.underflow) { r.udf++; dut.underflow = false; }
+
+    // scoreboard：数据、状态标志、水位三者都要比
+    bool bad = (doutDut != doutRef) || (fullD != fullR) || (emptyD != emptyR) ||
+               (dut.count != (int)ref.q.size());
+    if (bad) {
+        if (r.mismatches == 0) {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "cycle %ld: wr=%d rd=%d din=%d | dut(dout=%d full=%d empty=%d cnt=%d) "
+                     "ref(dout=%d full=%d empty=%d cnt=%d)",
+                     r.cycles, wr, rd, din, doutDut, fullD, emptyD, dut.count,
+                     doutRef, fullR, emptyR, (int)ref.q.size());
+            r.firstMismatch = buf;
+        }
+        r.mismatches++;
+    }
+
+    if (cov) {
+        sampleCoverage(*cov, wr, rd, din, cntBefore, g_depth);
+        if (wr && prevWr) cov->hitBin("b2b_write", 0);
+        if (rd && prevRd) cov->hitBin("b2b_read", 0);
+        if (rd && cntBefore == g_depth) cov->hitBin("wrap_around", 0);
+    }
+}
+
+// ---------------- 约束随机激励 ----------------
+struct Gen {
+    std::mt19937 rng;
+    std::uniform_int_distribution<int> rnd{0, 99};
+    std::uniform_int_distribution<int> din{0, 255};
+    int idleRun = 0;
+
+    explicit Gen(uint32_t seed) : rng(seed) {}
+
+    // 约束：连续 idle 不超过 2 拍；随机权重偏向让水位来回走
+    void next(int count, int depth, bool& wr, bool& rd, int& d) {
+        int roll = rnd(rng);
+        wr = rd = false;
+        d = din(rng);
+
+        if (idleRun >= 2) {                       // 约束：不允许长时间空转
+            roll = 10 + (roll % 40);
+        }
+        if (count == 0) {                          // 空时读没有意义，把权重挪给写
+            wr = (roll < 85);
+            rd = false;
+            idleRun = wr ? 0 : idleRun + 1;
+        } else if (count == depth) {               // 满时写没有意义，把权重挪给读
+            rd = (roll < 80);
+            wr = (roll >= 80);
+            idleRun = (wr || rd) ? 0 : idleRun + 1;
+        } else {
+            if (roll < 45) wr = true;
+            else if (roll < 75) rd = true;
+            else if (roll < 95) { wr = true; rd = true; }   // 同拍读写最容易出 bug
+            else idleRun++;
+            if (wr || rd) idleRun = 0;
+        }
+    }
+};
+
+static void printCoverage(const char* title, Coverage& c) {
+    printf("\n--- %s：覆盖率 %.1f%% ---\n", title, c.percent());
+    for (auto& kv : c.bins) {
+        printf("  %-16s %s\n", kv.first.c_str(), kv.second.first > 0 ? "hit" : "MISS");
+    }
+}
+
+int main(int argc, char** argv) {
+    uint32_t seed = 20261116;
+    bool injectBug = false;
+    long cycles = 20000;
+    int depth = 8;
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cycles") && i + 1 < argc) cycles = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--depth") && i + 1 < argc) depth = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--inject-bug")) injectBug = true;
+    }
+    g_depth = depth;
+
+    printf("=== mini DV：同步 FIFO 随机验证 ===\n");
+    printf("配置：depth=%d  cycles=%ld  seed=%u%s\n", depth, cycles, seed,
+           injectBug ? "  [已注入 bug：满写不忽略]" : "");
+
+    Fifo dut(depth);
+    dut.bug = injectBug;
+    RefModel ref(depth);
+    Gen gen(seed);
+    Result res;
+    Coverage cov;
+    initCoverage(cov);
+
+    bool prevWr = false, prevRd = false;
+    for (long i = 0; i < cycles; ++i) {
+        bool wr, rd; int din;
+        gen.next(dut.count, depth, wr, rd, din);
+        stepOne(dut, ref, wr, rd, din, res, &cov, prevWr, prevRd);
+        prevWr = wr; prevRd = rd;
+    }
+
+    printf("\n随机跑完：%ld 拍，写 %ld 次、读 %ld 次，溢出忽略 %ld 次、空读忽略 %ld 次\n",
+           res.cycles, res.wrCycles, res.rdCycles, res.ovf, res.udf);
+    printf("scoreboard：mismatch %ld 处%s\n", res.mismatches,
+           res.mismatches ? "（见下）" : "，DUT 与参考模型完全一致");
+    if (res.mismatches) printf("  首个失配 -> %s\n", res.firstMismatch.c_str());
+    printCoverage("随机激励", cov);
+    const double covRandom = cov.percent();
+    const size_t missRandom = cov.missed().size();
+
+    // ---------- 定向用例：补随机没打到的地方 ----------
+    auto missed = cov.missed();
+    printf("\n覆盖率缺口 %zu 项，启动定向用例补齐：\n", missed.size());
+    for (auto& m : missed) printf("  - %s\n", m.c_str());
+
+    // 定向 1：把水位推到满，再在满的时候连续写两拍（x_full_wr + b2b_write）
+    {
+        Fifo d2(depth); RefModel r2(depth); Result r3;
+        for (int i = 0; i < depth; ++i) stepOne(d2, r2, true, false, 100 + i, r3, nullptr, false, false);
+        stepOne(d2, r2, true, false, 200, r3, &cov, false, false);
+        stepOne(d2, r2, true, false, 201, r3, &cov, true, false);
+        res.mismatches += r3.mismatches;
+    }
+    // 定向 2：空的时候连续读两拍（x_empty_rd + b2b_read）
+    {
+        Fifo d2(depth); RefModel r2(depth); Result r3;
+        stepOne(d2, r2, false, true, 0, r3, &cov, false, false);
+        stepOne(d2, r2, false, true, 0, r3, &cov, false, true);
+        res.mismatches += r3.mismatches;
+    }
+    // 定向 3：写满后读走一个再写（回绕 + 边界 din）
+    {
+        Fifo d2(depth); RefModel r2(depth); Result r3;
+        for (int i = 0; i < depth; ++i) stepOne(d2, r2, true, false, 255, r3, nullptr, false, false);
+        stepOne(d2, r2, false, true, 0, r3, &cov, false, false);          // wrap_around
+        stepOne(d2, r2, true, false, 0, r3, &cov, false, false);          // din_range=0
+        stepOne(d2, r2, true, false, 255, r3, &cov, true, false);         // din_range=3
+        res.mismatches += r3.mismatches;
+    }
+
+    printCoverage("补定向后", cov);
+
+    printf("\n=== 结论 ===\n");
+    printf("随机 %ld 拍覆盖 %.1f%%（缺 %zu 项）；补 3 个定向用例后 %.1f%%\n",
+           cycles, covRandom, missRandom, cov.percent());
+    printf("scoreboard 全程 mismatch：%ld\n", res.mismatches);
+    return res.mismatches ? 1 : 0;
+}
