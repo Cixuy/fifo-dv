@@ -144,8 +144,8 @@ struct Result {
 static int g_depth = 8;
 
 // 单拍执行 + 比对（DUT 与参考模型并行推进）
-static inline void stepOne(Fifo& dut, RefModel& ref, bool wr, bool rd, int din, Result& r,
-                           Coverage* cov, bool prevWr, bool prevRd) {
+static inline int stepOne(Fifo& dut, RefModel& ref, bool wr, bool rd, int din, Result& r,
+                          Coverage* cov, bool prevWr, bool prevRd, bool* bad = nullptr) {
     int doutDut = 0, doutRef = 0;
     bool fullD, emptyD, fullR, emptyR;
     int cntBefore = dut.count;
@@ -160,9 +160,9 @@ static inline void stepOne(Fifo& dut, RefModel& ref, bool wr, bool rd, int din, 
     if (dut.underflow) { r.udf++; dut.underflow = false; }
 
     // scoreboard：数据、状态标志、水位三者都要比
-    bool bad = (doutDut != doutRef) || (fullD != fullR) || (emptyD != emptyR) ||
-               (dut.count != (int)ref.q.size());
-    if (bad) {
+    bool badFlag = (doutDut != doutRef) || (fullD != fullR) || (emptyD != emptyR) ||
+                   (dut.count != (int)ref.q.size());
+    if (badFlag) {
         if (r.mismatches == 0) {
             char buf[256];
             snprintf(buf, sizeof(buf),
@@ -174,6 +174,7 @@ static inline void stepOne(Fifo& dut, RefModel& ref, bool wr, bool rd, int din, 
         }
         r.mismatches++;
     }
+    if (bad) *bad = badFlag;
 
     if (cov) {
         sampleCoverage(*cov, wr, rd, din, cntBefore, g_depth);
@@ -181,6 +182,7 @@ static inline void stepOne(Fifo& dut, RefModel& ref, bool wr, bool rd, int din, 
         if (rd && prevRd) cov->hitBin("b2b_read", 0);
         if (rd && cntBefore == g_depth) cov->hitBin("wrap_around", 0);
     }
+    return doutDut;
 }
 
 // ---------------- 约束随机激励 ----------------
@@ -229,6 +231,8 @@ static void printCoverage(const char* title, Coverage& c) {
 int main(int argc, char** argv) {
     uint32_t seed = 20261116;
     bool injectBug = false;
+    std::string jsonPath;
+    int window = 240;
     long cycles = 20000;
     int depth = 8;
     for (int i = 1; i < argc; ++i) {
@@ -236,6 +240,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--cycles") && i + 1 < argc) cycles = atol(argv[++i]);
         else if (!strcmp(argv[i], "--depth") && i + 1 < argc) depth = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--inject-bug")) injectBug = true;
+        else if (!strcmp(argv[i], "--json") && i + 1 < argc) jsonPath = argv[++i];
+        else if (!strcmp(argv[i], "--window") && i + 1 < argc) window = atoi(argv[++i]);
     }
     g_depth = depth;
 
@@ -252,10 +258,18 @@ int main(int argc, char** argv) {
     initCoverage(cov);
 
     bool prevWr = false, prevRd = false;
+    std::vector<int> sWr, sRd, sFull, sEmpty, sCnt, sDout, sMis;
     for (long i = 0; i < cycles; ++i) {
         bool wr, rd; int din;
         gen.next(dut.count, depth, wr, rd, din);
-        stepOne(dut, ref, wr, rd, din, res, &cov, prevWr, prevRd);
+        bool bad = false;
+        int dout = stepOne(dut, ref, wr, rd, din, res, &cov, prevWr, prevRd, &bad);
+        if ((long)sWr.size() < window) {
+            sWr.push_back(wr); sRd.push_back(rd);
+            sFull.push_back(dut.count == depth); sEmpty.push_back(dut.count == 0);
+            sCnt.push_back(dut.count); sDout.push_back(dout);
+            sMis.push_back(bad ? 1 : 0);
+        }
         prevWr = wr; prevRd = rd;
     }
 
@@ -266,6 +280,8 @@ int main(int argc, char** argv) {
     if (res.mismatches) printf("  首个失配 -> %s\n", res.firstMismatch.c_str());
     printCoverage("随机激励", cov);
     const double covRandom = cov.percent();
+    std::vector<std::pair<std::string, bool>> covSnap;   // 随机阶段快照，和 94.1% 对得上
+    for (auto& kv : cov.bins) covSnap.push_back({kv.first, kv.second.first > 0});
     const size_t missRandom = cov.missed().size();
 
     // ---------- 定向用例：补随机没打到的地方 ----------
@@ -299,6 +315,40 @@ int main(int argc, char** argv) {
     }
 
     printCoverage("补定向后", cov);
+
+    if (!jsonPath.empty()) {
+        FILE* f = fopen(jsonPath.c_str(), "w");
+        if (f) {
+            fprintf(f, "{\n\"config\":{\"depth\":%d,\"cycles\":%ld,\"seed\":%u,\"bug\":%s},\n",
+                    depth, cycles, seed, injectBug ? "true" : "false");
+            fprintf(f, "\"summary\":{\"mismatch\":%ld,\"ovf\":%ld,\"udf\":%ld,\"covRandom\":%.1f,\"covFinal\":%.1f,\"missing\":\"%s\"},\n",
+                    res.mismatches, res.ovf, res.udf, covRandom, cov.percent(),
+                    missRandom ? "x_empty_rd" : "");
+            fprintf(f, "\"window\":%zu,\n", sWr.size());
+            auto dumpArr = [&](const char* k, std::vector<int>& v, bool last) {
+                fprintf(f, "\"%s\":[", k);
+                for (size_t i = 0; i < v.size(); ++i) fprintf(f, "%d%s", v[i], i + 1 < v.size() ? "," : "");
+                fprintf(f, "]%s\n", last ? "" : ",");
+            };
+            dumpArr("wr", sWr, false);
+            dumpArr("rd", sRd, false);
+            dumpArr("full", sFull, false);
+            dumpArr("empty", sEmpty, false);
+            dumpArr("cnt", sCnt, false);
+            dumpArr("dout", sDout, false);
+            dumpArr("mis", sMis, true);
+            fprintf(f, ",\"coverage\":[");
+            bool first = true;
+            for (auto& kv : covSnap) {
+                fprintf(f, "%s{\"name\":\"%s\",\"hit\":%s}", first ? "" : ",",
+                        kv.first.c_str(), kv.second ? "true" : "false");
+                first = false;
+            }
+            fprintf(f, "]\n}\n");
+            fclose(f);
+            printf("\n已写出 trace JSON：%s\n", jsonPath.c_str());
+        }
+    }
 
     printf("\n=== 结论 ===\n");
     printf("随机 %ld 拍覆盖 %.1f%%（缺 %zu 项）；补 3 个定向用例后 %.1f%%\n",

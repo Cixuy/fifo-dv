@@ -4,7 +4,9 @@
 
 没有 Verilator、没有 Questa、没有 UVM 库，全是 C++ 标准库。做它的目的不是替代商业工具，而是把「验证方法学」本身跑通一遍：为什么随机不能只随机、覆盖率到 100% 意味着什么、scoreboard 为什么要独立于 DUT。
 
-![运行结果](docs/overview.png)
+![可视化报告](docs/ui_bug.png)
+
+![终端输出](docs/overview.png)
 
 ## 平台结构
 
@@ -31,6 +33,21 @@ generator(CRV)  ──transaction──▶  driver  ──引脚──▶  DUT(s
 | `x_empty_rd` | 空的时候还给了读使能 |
 | `b2b_write` / `b2b_read` | 连续两拍同向操作（背靠背） |
 | `wrap_around` | 写满之后读走再写，指针回绕 |
+
+## 可视化报告
+
+终端只有数字，看不出时序。所以加了一个单文件报告（内嵌数据，双击打开，不需要服务器）：
+
+```bash
+./fifo-dv --json trace.json                 # 导出信号窗口 + 覆盖率
+python tools/report.py trace.json docs/report.html
+```
+
+报告里有三块：
+
+- **波形**：`wr_en / rd_en / full / empty / dout` 逐拍电平，鼠标悬停看该拍全部信号值；scoreboard 失配的拍用红色竖条标出（上面那张图里 110–150 拍之间那两条红带就是注入 bug 后的失配窗口）
+- **水位曲线**：FIFO 内元素个数随时间变化，虚线是容量上限，能直观看到「涨到满、回绕、掉空」的过程
+- **覆盖率网格**：17 个 bin 逐个显示 hit / MISS，`x_empty_rd` 是唯一没命中的那个
 
 ## 跑起来
 
