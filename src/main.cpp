@@ -232,6 +232,7 @@ int main(int argc, char** argv) {
     uint32_t seed = 20261116;
     bool injectBug = false;
     std::string jsonPath;
+    std::string covJsonPath;
     int window = 240;
     long cycles = 20000;
     int depth = 8;
@@ -242,6 +243,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--inject-bug")) injectBug = true;
         else if (!strcmp(argv[i], "--json") && i + 1 < argc) jsonPath = argv[++i];
         else if (!strcmp(argv[i], "--window") && i + 1 < argc) window = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cov-json") && i + 1 < argc) covJsonPath = argv[++i];
     }
     g_depth = depth;
 
@@ -347,6 +349,30 @@ int main(int argc, char** argv) {
             fprintf(f, "]\n}\n");
             fclose(f);
             printf("\n已写出 trace JSON：%s\n", jsonPath.c_str());
+        }
+    }
+
+    // 覆盖率单独落一份 JSON：只关心「哪些 bin 命中」，体积小，方便多 seed 跑完做趋势对比
+    if (!covJsonPath.empty()) {
+        FILE* cf = fopen(covJsonPath.c_str(), "w");
+        if (cf) {
+            fprintf(cf, "{\"seed\":%u,\"depth\":%d,\"cycles\":%ld,\"covRandom\":%.1f,\"covFinal\":%.1f,\"bins\":{",
+                    seed, depth, cycles, covRandom, cov.percent());
+            bool firstB = true;
+            for (auto& kv : cov.bins) {
+                fprintf(cf, "%s\"%s\":%d", firstB ? "" : ",", kv.first.c_str(), kv.second.first);
+                firstB = false;
+            }
+            // 随机阶段快照：能看出"哪个 bin 是随机没打到、靠定向补的"
+            fprintf(cf, "},\"randomBins\":{");
+            bool firstR = true;
+            for (auto& kv : covSnap) {
+                fprintf(cf, "%s\"%s\":%d", firstR ? "" : ",", kv.first.c_str(), kv.second ? 1 : 0);
+                firstR = false;
+            }
+            fprintf(cf, "}}\n");
+            fclose(cf);
+            printf("\n已写出覆盖率 JSON：%s\n", covJsonPath.c_str());
         }
     }
 

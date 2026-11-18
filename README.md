@@ -56,6 +56,18 @@ g++ -std=c++17 -O2 -static -Isrc src/main.cpp -o fifo-dv
 ./fifo-dv                                   # 20000 拍随机 + 定向
 ./fifo-dv --seed 42 --cycles 5000 --depth 16
 ./fifo-dv --inject-bug                      # 注入 bug，看平台能不能抓到
+./fifo-dv --cov-json cov.json               # 只导出覆盖率（体积小，适合多 seed 批量跑）
+```
+
+`--cov-json` 会同时写两份 bin：`bins` 是补完定向用例后的最终覆盖率，`randomBins` 是**随机阶段的快照**。
+后者才有诊断价值——三个 seed 各跑一遍，缺的都是同一个 `x_empty_rd[0]`，说明这个洞不是随机性不够，
+而是生成器约束主动排除了「空读」这种非法场景，必须靠定向用例补：
+
+```bash
+for s in 1 2 3; do ./fifo-dv --seed $s --cov-json out/cov_$s.json >/dev/null; done
+# seed 1 随机 94.1 → 最终 100.0   随机缺口 x_empty_rd[0]
+# seed 2 随机 94.1 → 最终 100.0   随机缺口 x_empty_rd[0]
+# seed 3 随机 94.1 → 最终 100.0   随机缺口 x_empty_rd[0]
 ```
 
 ## 实测
