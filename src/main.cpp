@@ -4,12 +4,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <random>
-#include <string>
 #include <string>
 #include <vector>
 
@@ -228,6 +229,22 @@ static void printCoverage(const char* title, Coverage& c) {
     }
 }
 
+// 严格解析整数参数。以前全是裸 atoi："--depth abc" 静默变 0，于是 FIFO 深度 0、
+// 读永远不成功，平台照样打印 "mismatch 0 / 完全一致"——什么都没测却像满分；
+// "--depth -3" 更直接在 std::vector 构造时抛 length_error 崩掉。参数写错必须立刻退 2，
+// 否则一个假通过的回归比失败更危险。
+static bool parseInt(const char* name, const char* s, long long lo, long long hi, long long& out) {
+    char* end = nullptr;
+    errno = 0;
+    long long v = strtoll(s, &end, 10);
+    if (end == s || *end != '\0' || errno == ERANGE || v < lo || v > hi) {
+        fprintf(stderr, "error: %s 需要 [%lld, %lld] 内的整数（当前 \"%s\"）\n", name, lo, hi, s);
+        return false;
+    }
+    out = v;
+    return true;
+}
+
 int main(int argc, char** argv) {
     uint32_t seed = 20261116;
     bool injectBug = false;
@@ -237,13 +254,25 @@ int main(int argc, char** argv) {
     long cycles = 20000;
     int depth = 8;
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--cycles") && i + 1 < argc) cycles = atol(argv[++i]);
-        else if (!strcmp(argv[i], "--depth") && i + 1 < argc) depth = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--inject-bug")) injectBug = true;
-        else if (!strcmp(argv[i], "--json") && i + 1 < argc) jsonPath = argv[++i];
-        else if (!strcmp(argv[i], "--window") && i + 1 < argc) window = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--cov-json") && i + 1 < argc) covJsonPath = argv[++i];
+        const char* a = argv[i];
+        const bool hasVal = i + 1 < argc && argv[i + 1][0] != '\0';
+        long long v = 0;
+        bool ok = true;
+        if (!strcmp(a, "--inject-bug")) { injectBug = true; continue; }
+        if (!hasVal) { fprintf(stderr, "error: %s 缺少参数（或参数名写错）\n", a); ok = false; }
+        else if (!strcmp(a, "--json")) jsonPath = argv[++i];
+        else if (!strcmp(a, "--cov-json")) covJsonPath = argv[++i];
+        else if (!strcmp(a, "--seed")) { ok = parseInt(a, argv[++i], 0, 4294967295LL, v); seed = (uint32_t)v; }
+        else if (!strcmp(a, "--cycles")) { ok = parseInt(a, argv[++i], 1, 10000000LL, v); cycles = (long)v; }
+        else if (!strcmp(a, "--depth")) { ok = parseInt(a, argv[++i], 1, 4096, v); depth = (int)v; }
+        else if (!strcmp(a, "--window")) { ok = parseInt(a, argv[++i], 1, 100000, v); window = (int)v; }
+        else { fprintf(stderr, "error: 未知参数 \"%s\"\n", a); ok = false; }
+        if (!ok) {
+            fprintf(stderr,
+                    "usage: fifo_dv [--depth 1..4096] [--cycles 1..10000000] [--seed 0..2^32-1]\n"
+                    "               [--window 1..100000] [--inject-bug] [--json FILE] [--cov-json FILE]\n");
+            return 2;
+        }
     }
     g_depth = depth;
 
